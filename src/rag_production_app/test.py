@@ -17,3 +17,4 @@ print("First 5 values:", embedding[:5])
 
 # uv run uvicorn main:app
 # inngest-cli dev -u http://127.0.0.1:8000/api/inngest --no-discovery
+# uv run streamlit run streamlit_app.py
