@@ -1,12 +1,13 @@
 import asyncio
-from pathlib import Path
-import time
-
-import streamlit as st
-import inngest
-from dotenv import load_dotenv
+import json
 import os
+import time
+from pathlib import Path
+
+import inngest
 import requests
+import streamlit as st
+from dotenv import load_dotenv
 
 load_dotenv()
 
@@ -21,9 +22,9 @@ def get_inngest_client() -> inngest.Inngest:
 def save_uploaded_pdf(file) -> Path:
     uploads_dir = Path("uploads")
     uploads_dir.mkdir(parents=True, exist_ok=True)
-    file_path = uploads_dir / file.name
-    file_bytes = file.getbuffer()
-    file_path.write_bytes(file_bytes)
+    # Path(...).name strips any directory parts, so "../../x.pdf" can't escape uploads/
+    file_path = uploads_dir / Path(file.name).name
+    file_path.write_bytes(file.getbuffer())
     return file_path
 
 
@@ -40,24 +41,7 @@ async def send_rag_ingest_event(pdf_path: Path) -> None:
     )
 
 
-st.title("Upload a PDF to Ingest")
-uploaded = st.file_uploader("Choose a PDF", type=["pdf"], accept_multiple_files=False)
-
-if uploaded is not None:
-    with st.spinner("Uploading and triggering ingestion..."):
-        path = save_uploaded_pdf(uploaded)
-        # Kick off the event and block until the send completes
-        asyncio.run(send_rag_ingest_event(path))
-        # Small pause for user feedback continuity
-        time.sleep(0.3)
-    st.success(f"Triggered ingestion for: {path.name}")
-    st.caption("You can upload another PDF if you like.")
-
-st.divider()
-st.title("Ask a question about your PDFs")
-
-
-async def send_rag_query_event(question: str, top_k: int) -> None:
+async def send_rag_query_event(question: str, top_k: int) -> str:
     client = get_inngest_client()
     result = await client.send(
         inngest.Event(
@@ -68,7 +52,6 @@ async def send_rag_query_event(question: str, top_k: int) -> None:
             },
         )
     )
-
     return result[0]
 
 
@@ -79,66 +62,77 @@ def _inngest_api_base() -> str:
 
 def fetch_runs(event_id: str) -> list[dict]:
     url = f"{_inngest_api_base()}/events/{event_id}/runs"
-
-    resp = requests.get(
-        url,
-        params={"includeOutput": "true"},
-        timeout=10,
-    )
+    resp = requests.get(url, params={"includeOutput": "true"}, timeout=10)
     resp.raise_for_status()
-
-    data = resp.json()
-    return data.get("data", [])
+    return resp.json().get("data", [])
 
 
 def wait_for_run_output(
     event_id: str,
-    timeout_s: float = 180.0,
-    poll_interval_s: float = 1.0,
+    timeout_s: float = 300.0,
+    poll_interval_s: float = 1.5,
 ) -> dict:
     start = time.time()
-    last_status = None
+    last_run: dict = {}
 
     while time.time() - start < timeout_s:
         runs = fetch_runs(event_id)
 
         if runs:
-            # Find the run associated with the event.
             run = runs[0]
+            last_run = run
             status = run.get("status", "")
-            last_status = status
-
-            if status == "Completed":
-                output = run.get("output")
-
-                if isinstance(output, dict):
-                    return output
-
-                if isinstance(output, str):
-                    import json
-
-                    try:
-                        parsed = json.loads(output)
-                        if isinstance(parsed, dict):
-                            return parsed
-                    except json.JSONDecodeError:
-                        pass
-
-                # Print the response shape to diagnose missing output.
-                st.warning(
-                    "Inngest completed the run, but its output was "
-                    "missing or had an unexpected format."
-                )
-                st.json(run)
-                return {}
 
             if status in ("Failed", "Cancelled"):
                 raise RuntimeError(f"Inngest function run {status}: {run}")
 
+            if status == "Completed":
+                output = run.get("output")
+
+                if isinstance(output, str):
+                    try:
+                        output = json.loads(output)
+                    except json.JSONDecodeError:
+                        output = None
+
+                if isinstance(output, dict):
+                    return output
+                # Status says Completed but there's no output yet
+                # (ended_at is still null), so keep polling.
+
         time.sleep(poll_interval_s)
 
-    raise TimeoutError(f"Timed out waiting for Inngest. " f"Last status: {last_status}")
+    st.warning("Timed out waiting for the run's output. Last response from Inngest:")
+    st.json(last_run)
+    raise TimeoutError("Timed out waiting for Inngest to produce an output.")
 
+
+# ---------------------------------------------------------------- Ingest UI
+st.title("Upload a PDF to Ingest")
+uploaded = st.file_uploader("Choose a PDF", type=["pdf"], accept_multiple_files=False)
+
+if uploaded is not None:
+    # Streamlit reruns this script on every interaction (including the question
+    # form below), and the uploader keeps returning the same file. Without this
+    # guard the PDF would be re-ingested on every rerun.
+    file_key = f"{uploaded.name}:{uploaded.size}"
+
+    if st.session_state.get("ingested_key") != file_key:
+        try:
+            with st.spinner("Uploading and triggering ingestion..."):
+                path = save_uploaded_pdf(uploaded)
+                asyncio.run(send_rag_ingest_event(path))
+            st.session_state["ingested_key"] = file_key
+            st.success(f"Triggered ingestion for: {path.name}")
+            st.caption("You can upload another PDF if you like.")
+        except Exception as exc:
+            st.error(f"Could not trigger ingestion: {exc}")
+    else:
+        st.caption(f"{uploaded.name} was already sent for ingestion.")
+
+# ----------------------------------------------------------------- Query UI
+st.divider()
+st.title("Ask a question about your PDFs")
 
 with st.form("rag_query_form"):
     question = st.text_input("Your question")
@@ -147,14 +141,16 @@ with st.form("rag_query_form"):
     )
     submitted = st.form_submit_button("Ask")
 
-    if submitted and question.strip():
+if submitted and question.strip():
+    try:
         with st.spinner("Sending event and generating answer..."):
-            # Fire-and-forget event to Inngest for observability/workflow
             event_id = asyncio.run(send_rag_query_event(question.strip(), int(top_k)))
-            # Poll the local Inngest API for the run's output
             output = wait_for_run_output(event_id)
-            answer = output.get("answer", "")
-            sources = output.get("sources", [])
+    except Exception as exc:
+        st.error(f"Something went wrong while answering: {exc}")
+    else:
+        answer = output.get("answer", "")
+        sources = output.get("sources", [])
 
         st.subheader("Answer")
         st.write(answer or "(No answer)")

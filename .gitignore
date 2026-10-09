@@ -26,3 +26,6 @@ Thumbs.db
 # Qdrant local storage
 qdrant_storage/
 qdrant_storage;C/
+
+src/rag_production_app/test.py
+eval/dataset.jsonl

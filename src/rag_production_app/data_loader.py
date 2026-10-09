@@ -1,30 +1,35 @@
-from openai import OpenAI
+from openai import AsyncOpenAI
 from llama_index.readers.file import PDFReader
 from llama_index.core.node_parser import SentenceSplitter
-from dotenv import load_dotenv
 
-load_dotenv()
+from rag_production_app.config import settings
+from rag_production_app.custom_types import Chunk
 
-client = OpenAI(base_url="http://localhost:11434/v1", api_key="ollama")
-MODEL = "qwen3.5:2b"
-EMBED_MODEL = "nomic-embed-text:latest"
-EMBED_DIM = 768
+client = AsyncOpenAI(base_url=settings.ollama_base_url, api_key="ollama")
+splitter = SentenceSplitter(
+    chunk_size=settings.chunk_size,
+    chunk_overlap=settings.chunk_overlap,
+)
 
-splitter = SentenceSplitter(chunk_size=1000, chunk_overlap=0)
 
+def load_and_chunk_pdf(path: str) -> list[Chunk]:
+    """Sync and CPU-bound. Call it with asyncio.to_thread."""
+    chunks: list[Chunk] = []
+    for doc in PDFReader().load_data(file=path):
+        if not doc.text:
+            continue
+        page = doc.metadata.get("page_label")
+        for text in splitter.split_text(doc.text):
+            chunks.append(Chunk(text=text, page=page))
 
-def load_and_chunk_pdf(path: str):
-    docs = PDFReader().load_data(file=path)
-    texts = [d.text for d in docs if getattr(d, "text", None)]
-    chunks = []
-    for t in texts:
-        chunks.extend(splitter.split_text(t))
     return chunks
 
 
-def embed_texts(texts: list[str]) -> list[list[float]]:
-    response = client.embeddings.create(
-        model=EMBED_MODEL,
-        input=texts,
-    )
-    return [item.embedding for item in response.data]
+async def embed_texts(texts: list[str], prefix: str = "") -> list[list[float]]:
+    vectors: list[list[float]] = []
+    size = settings.embed_batch_size
+    for i in range(0, len(texts), size):
+        batch = [prefix + t for t in texts[i : i + size]]
+        resp = await client.embeddings.create(model=settings.embed_model, input=batch)
+        vectors.extend(item.embedding for item in resp.data)
+    return vectors
