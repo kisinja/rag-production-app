@@ -1,6 +1,7 @@
 import asyncio
 import logging
 import uuid
+import datetime
 
 import inngest
 import inngest.fast_api
@@ -25,7 +26,19 @@ inngest_client = inngest.Inngest(
 
 
 @inngest_client.create_function(
-    fn_id="RAG: Inngest PDF", trigger=inngest.TriggerEvent(event="rag/ingest_pdf")
+    fn_id="RAG: Inngest PDF",
+    trigger=inngest.TriggerEvent(event="rag/ingest_pdf"),
+    rate_limit=inngest.RateLimit(
+        limit=1,
+        period=datetime.timedelta(hours=4),
+        key="event.data.source_id",
+    ),
+    throttle=inngest.Throttle(
+        limit=1,
+        period=datetime.timedelta(seconds=5),
+        burst=2,
+        key="event.data.source_id",
+    ),
 )
 async def rag_ingest_pdf(ctx: inngest.Context):
     async def _load() -> RAGChunkAndSrc:

@@ -29,3 +29,7 @@ qdrant_storage;C/
 
 src/rag_production_app/test.py
 eval/dataset.jsonl
+
+scripts.txt
+
+uploads
